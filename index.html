@@ -133,6 +133,11 @@
   .err-text{color:var(--danger);font-size:14px;margin-top:8px;min-height:1.2em}
 
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+  .sync{max-width:524px;margin:10px auto 0;padding:8px 14px;border-radius:10px;background:var(--surface);border:1px solid var(--line);font-size:14px;color:var(--muted);display:flex;align-items:center;gap:8px}
+  .sync[hidden]{display:none}
+  .sync::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--sun);flex:none}
+  .sync.busy::before{background:var(--accent)}
+  @media (max-width:560px){.sync{margin:10px 18px 0}}
 </style>
 </head>
 <body>
@@ -141,6 +146,7 @@
   <div class="brand"><img src="icon-192.png" alt="">Penny</div>
   <button class="who" id="whoBtn" data-act="who"></button>
 </header>
+<div class="sync" id="sync" role="status" hidden></div>
 
 <main id="view"><p class="muted">Loading…</p></main>
 
@@ -159,7 +165,7 @@
 <script>
 /* ===== CONFIG: paste your Apps Script web app URL (ends in /exec) ===== */
 const API_URL = 'https://script.google.com/macros/s/AKfycbwkPazp1swt1zhdXQXhXLEPk5axVvo4Goy7JvfqDeomWCfsVnS5v3JbdyDznOMlRlu4/exec';
-const VERSION = '1.0.1';
+const VERSION = '1.1.0';
 
 /* ---------- Helpers ---------- */
 const $ = s => document.querySelector(s);
@@ -171,6 +177,8 @@ const iso = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.get
 const parse = s => { const p = s.split('-').map(Number); return new Date(p[0], p[1] - 1, p[2]); };
 const today = () => { const t = new Date(); t.setHours(0, 0, 0, 0); return t; };
 const sum = list => list.reduce((t, x) => t + x.amount, 0);
+const clone = o => JSON.parse(JSON.stringify(o));
+const eq = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 const MON = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -179,19 +187,32 @@ const dayLabel = d => DOW[d.getDay()] + ' ' + d.getDate() + ' ' + MON[d.getMonth
 const parseAmt = v => Math.round(Number(String(v).replace(/[^\d.,]/g, '').replace(',', '.')) * 100) / 100;
 const normKey = k => String(k || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const showKey = k => (normKey(k).match(/.{1,4}/g) || []).join('-');
+const plural = (n, w) => n + ' ' + w + (n === 1 ? '' : 's');
 const APP_LINK = location.origin + location.pathname;
 
-// Phone storage (this device only). Wrapped because storage can throw in private modes.
+// Random id made on the phone, so an entry has its final id even before it reaches the Sheet
+function uid() {
+  const a = new Uint8Array(12);
+  crypto.getRandomValues(a);
+  return Array.from(a, b => '0123456789abcdefghijklmnopqrstuvwxyz'[b % 36]).join('');
+}
+
+// Phone storage (this device only). Falls back to keys saved before the rename.
 const store = {
-  get: k => { try { return localStorage.getItem('penny.' + k) ?? localStorage.getItem('kitty.' + k); } catch (e) { return null; } }, // falls back to pre-rename keys
+  get: k => { try { return localStorage.getItem('penny.' + k) ?? localStorage.getItem('kitty.' + k); } catch (e) { return null; } },
   set: (k, v) => { try { localStorage.setItem('penny.' + k, v); } catch (e) {} },
   del: k => { try { localStorage.removeItem('penny.' + k); localStorage.removeItem('kitty.' + k); } catch (e) {} }
 };
+function loadJSON(k, fallback) { try { return JSON.parse(store.get(k) || 'null') || fallback; } catch (e) { return fallback; } }
 
 const S = {
-  data: null, tab: 'overview', view: 'month', offset: 0, filter: 'all',
+  server: loadJSON('data', null),   // last copy received from the Sheet
+  outbox: loadJSON('outbox', []),   // changes saved on this phone, not yet in the Sheet
+  data: null,                       // what's shown: server copy + outbox replayed on top
+  tab: 'overview', view: 'month', offset: 0, filter: 'all',
   key: store.get('key') || '', who: store.get('who') || '',
-  draft: null, adj: null, sw: null, locked: false
+  draft: null, adj: null, sw: null, locked: false,
+  flushing: false, reqSeq: 0, appliedSeq: 0
 };
 
 /* ---------- Talking to the backend ---------- */
@@ -209,10 +230,16 @@ async function call(action, ...args) {
       redirect: 'follow'
     });
   } catch (e) {
-    throw new Error('Can’t reach the server. Check your internet connection and try again.');
+    const err = new Error('Can’t reach the server. Check your internet connection.');
+    err.code = 'OFFLINE';
+    throw err;
   }
   try { out = await res.json(); }
-  catch (e) { throw new Error('The server sent an unexpected reply. Check the Apps Script deployment is set to “Anyone”.'); }
+  catch (e) {
+    const err = new Error('The server sent an unexpected reply. Check the Apps Script deployment is set to “Anyone”.');
+    err.code = 'OFFLINE'; // treat like a connection problem: keep changes queued
+    throw err;
+  }
   if (!out.ok) {
     const err = new Error(out.error || 'Something went wrong.');
     err.code = out.code;
@@ -223,6 +250,113 @@ async function call(action, ...args) {
 }
 function errMsg(e) { return (e && e.message ? e.message : String(e)).replace(/^(Exception|Error):\s*/, ''); }
 
+/* ---------- Offline outbox ----------
+   Every change is applied to the screen immediately and added to the outbox.
+   flush() sends the outbox to the Sheet in one batch. Anything that doesn't get
+   through stays queued and is retried when the connection returns. */
+
+// Mirrors of the server's write functions, used to show queued changes straight away
+const LOCAL = {
+  saveExpense:    (d, x) => upsertBy(d.expenses, 'id', x),
+  deleteExpense:  (d, id) => removeBy(d.expenses, 'id', id),
+  saveIncome:     (d, x) => upsertBy(d.income, 'id', x),
+  deleteIncome:   (d, id) => removeBy(d.income, 'id', id),
+  saveGoal:       (d, g) => upsertBy(d.goals, 'id', g),
+  adjustGoal:     (d, id, delta) => { const g = d.goals.find(g => eq(g.id, id)); if (g) g.saved = Math.max(0, Math.round((g.saved + delta) * 100) / 100); },
+  deleteGoal:     (d, id) => removeBy(d.goals, 'id', id),
+  saveCategory:   (d, name, color) => upsertBy(d.categories, 'name', { name, color }),
+  deleteCategory: (d, name) => removeBy(d.categories, 'name', name),
+  savePreset:     (d, name, category) => upsertBy(d.presets, 'name', { name, category }),
+  deletePreset:   (d, name) => removeBy(d.presets, 'name', name),
+  addPerson:      (d, name) => { if (!d.people.some(p => eq(p, name))) d.people.push(name); },
+  deletePerson:   (d, name) => { d.people = d.people.filter(p => !eq(p, name)); }
+};
+function upsertBy(list, key, obj) {
+  const i = list.findIndex(o => eq(o[key], obj[key]));
+  if (i > -1) list[i] = Object.assign({}, list[i], obj); else list.push(obj);
+}
+function removeBy(list, key, val) {
+  const i = list.findIndex(o => eq(o[key], val));
+  if (i > -1) list.splice(i, 1);
+}
+
+function saveOutbox() { store.set('outbox', JSON.stringify(S.outbox)); }
+
+function queue(action, args, okMsg) {
+  S.outbox.push({ id: uid(), action, args, at: Date.now() });
+  saveOutbox();
+  recompute();
+  if (okMsg) toast(okMsg);
+  flush();
+}
+
+// Rebuild what's on screen: the Sheet's copy with every pending change replayed on top
+function recompute() {
+  if (!S.server) return;
+  const d = clone(S.server);
+  S.outbox.forEach(op => { try { LOCAL[op.action](d, ...op.args); } catch (e) {} });
+  showData(d);
+}
+
+function setServer(d, seq) {
+  if (seq < S.appliedSeq) return; // an older reply arrived after a newer one: ignore it
+  S.appliedSeq = seq;
+  S.server = d;
+  store.set('data', JSON.stringify(d));
+  recompute();
+}
+
+let retryTimer = null;
+function scheduleRetry() {
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(() => { retryTimer = null; flush(); }, 20000);
+}
+
+async function flush() {
+  if (S.flushing || !S.outbox.length || !S.key) { updateSync(); return; }
+  S.flushing = true;
+  updateSync();
+  const batch = S.outbox.slice();
+  let sent = false;
+  try {
+    const res = await call('batch', batch.map(o => ({ id: o.id, action: o.action, args: o.args })));
+    const handled = new Set(res.results.map(r => r.id));
+    const failed = res.results.filter(r => !r.ok);
+    S.outbox = S.outbox.filter(o => !handled.has(o.id));
+    saveOutbox();
+    // This snapshot was read after our changes were written, so it outranks any reply still in flight
+    setServer(res.snapshot, ++S.reqSeq);
+    sent = true;
+    if (failed.length) toast(plural(failed.length, 'change') + ' couldn’t be saved: ' + failed[0].error, true);
+  } catch (e) {
+    if (e.code !== 'BAD_KEY') scheduleRetry();
+  } finally {
+    S.flushing = false;
+    updateSync();
+    // Changes made while this batch was in flight go out straight after
+    if (sent && S.outbox.length) flush();
+  }
+}
+
+async function refresh() {
+  if (!S.key) return;
+  const seq = ++S.reqSeq;
+  try { setServer(await call('getData'), seq); }
+  catch (e) { /* offline: keep showing the saved copy */ }
+  if (!S.server) $('#view').innerHTML = '<div class="empty">Penny needs a connection the first time it loads your data. Connect to the internet and reopen the app.</div>';
+}
+
+function updateSync() {
+  const el = $('#sync');
+  const n = S.outbox.length;
+  el.hidden = !n;
+  el.classList.toggle('busy', S.flushing);
+  if (n) el.textContent = S.flushing
+    ? 'Syncing ' + plural(n, 'change') + '…'
+    : plural(n, 'change') + ' saved on this phone, waiting for a connection';
+}
+
+/* ---------- UI helpers ---------- */
 let toastTimer;
 function toast(msg, isErr) {
   const t = $('#toast');
@@ -259,37 +393,18 @@ function armed(el, txt) {
   }, 3000);
   return false;
 }
-// Runs a backend action, then refreshes everything with the data it returns
-async function run(fn, args, btn, okMsg) {
-  busy(btn);
-  try {
-    setData(await call(fn, ...args));
-    if (okMsg) toast(okMsg);
-    return true;
-  } catch (e) {
-    if (e.code !== 'BAD_KEY') toast(errMsg(e), true);
-    unbusy(btn);
-    return false;
-  }
-}
 
 /* ---------- Data ---------- */
-function setData(d) {
+function showData(d) {
   S.data = d;
-  store.set('data', JSON.stringify(d)); // lets the app open instantly next time
-  const match = d.people.find(p => p.toLowerCase() === String(S.who).toLowerCase());
+  const match = d.people.find(p => eq(p, S.who));
   S.who = match || '';
   if (S.filter !== 'all' && !d.people.includes(S.filter)) S.filter = 'all';
   render();
   if (!S.who && !S.locked) openWho();
 }
-async function refresh(quiet) {
-  if (!S.key) return;
-  try { setData(await call('getData')); }
-  catch (e) { if (!quiet && e.code !== 'BAD_KEY') toast(errMsg(e), true); }
-}
 const catColor = name => { const c = S.data.categories.find(c => c.name === name); return c ? c.color : '#7A8794'; };
-const findPreset = name => S.data.presets.find(p => p.name.toLowerCase() === String(name).trim().toLowerCase());
+const findPreset = name => S.data.presets.find(p => eq(p.name, String(name).trim()));
 function presetsByUse() {
   const n = {};
   S.data.expenses.forEach(x => { const k = x.name.toLowerCase(); n[k] = (n[k] || 0) + 1; });
@@ -337,9 +452,14 @@ function relDay(d) {
 function render() {
   document.querySelectorAll('.bar [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
   $('#whoBtn').textContent = S.who || 'Who are you?';
+  updateSync();
   if (!S.data) return;
   const views = { overview: viewOverview, income: viewIncome, goals: viewGoals, settings: viewSettings };
+  // Keep anything typed into a form when a background sync re-renders the screen
+  const typed = {};
+  document.querySelectorAll('#view input[id]:not([readonly]), #view select[id]').forEach(el => { typed[el.id] = el.value; });
   $('#view').innerHTML = views[S.tab]();
+  Object.keys(typed).forEach(id => { const el = document.getElementById(id); if (el) el.value = typed[id]; });
 }
 
 function viewOverview() {
@@ -366,7 +486,7 @@ function viewOverview() {
   }
 
   h += '<div class="total">' + money(total) + '</div>' +
-       '<div class="muted">spent, ' + ex.length + ' ' + (ex.length === 1 ? 'expense' : 'expenses') + '</div>';
+       '<div class="muted">spent, ' + plural(ex.length, 'expense') + '</div>';
 
   if (total > 0) {
     h += '<div class="stripe">' + catList.map(([c, v]) =>
@@ -394,6 +514,7 @@ function viewOverview() {
   if (!ex.length) {
     h += '<div class="empty">Nothing logged for this period. Tap + to add an expense.</div>';
   } else {
+    const pending = new Set(S.outbox.filter(o => o.action === 'saveExpense').map(o => o.args[0].id));
     const byDay = {};
     ex.forEach(x => { (byDay[x.date] = byDay[x.date] || []).push(x); });
     Object.keys(byDay).sort().reverse().forEach(d => {
@@ -403,7 +524,7 @@ function viewOverview() {
           '<li class="tap" data-act="edit" data-id="' + esc(x.id) + '">' +
           '<i class="dot" style="background:' + esc(catColor(x.category)) + '"></i>' +
           '<div class="grow"><div class="t">' + esc(x.name) + '</div><div class="s">' + esc(x.category) +
-          (D.people.length > 1 ? ', ' + esc(x.who) : '') + '</div></div>' +
+          (D.people.length > 1 ? ', ' + esc(x.who) : '') + (pending.has(x.id) ? ', not synced yet' : '') + '</div></div>' +
           '<span class="amt">' + money(x.amount) + '</span></li>').join('') + '</ul>';
     });
   }
@@ -487,6 +608,7 @@ function viewSettings() {
       '<button class="x" data-act="delPreset" data-n="' + esc(p.name) + '" aria-label="Delete ' + esc(p.name) + '">×</button></li>').join('') + '</ul>' : '') +
     '<div class="row2"><div><label class="f" for="pName">Name</label><input id="pName" placeholder="e.g. Pharmacy"></div>' +
     '<div><label class="f" for="pCat">Category</label><select id="pCat">' + catOptions('') + '</select></div></div>' +
+    '<div class="err-text" id="pErr"></div>' +
     '<button class="btn" data-act="addPreset">Add quick pick</button>';
 
   h += '<h2>People</h2><ul class="rows">' + D.people.map(p =>
@@ -497,7 +619,9 @@ function viewSettings() {
 
   h += '<h2>This phone</h2><ul class="rows">' +
     '<li><div class="grow"><div class="t">Logging as ' + esc(S.who || 'nobody yet') + '</div></div>' +
-    '<button class="btn ghost" style="width:auto;margin:0;padding:8px 14px" data-act="who">Switch</button></li></ul>' +
+    '<button class="btn ghost" style="width:auto;margin:0;padding:8px 14px" data-act="who">Switch</button></li>' +
+    '<li><div class="grow"><div class="t">' + (S.outbox.length ? plural(S.outbox.length, 'change') + ' waiting to sync' : 'Everything is synced') + '</div></div>' +
+    '<button class="btn ghost" style="width:auto;margin:0;padding:8px 14px" data-act="syncNow">Sync now</button></li></ul>' +
     '<button class="btn danger" data-act="disconnect">Disconnect this phone</button>';
 
   h += '<h2>Set up another phone</h2><p class="note">Send them the app link and the access key. ' +
@@ -618,82 +742,120 @@ const ACTS = {
     S.key = k;
     busy(btn, 'Connecting…');
     try {
+      const seq = ++S.reqSeq;
       const d = await call('getData');
       store.set('key', k);
       closeSheet(true);
-      setData(d);
+      setServer(d, seq);
       toast('Connected');
+      flush();
     } catch (e) {
       S.key = '';
       unbusy(btn);
       if (!$('#kIn')) openSetup();
-      $('#kErr').textContent = errMsg(e);
+      $('#kErr').textContent = e.code === 'OFFLINE' ? 'Connecting needs internet. Try again once you’re online.' : errMsg(e);
     }
   },
   disconnect: el => {
-    if (!armed(el, 'Tap again to disconnect')) return;
-    ['key', 'who', 'data'].forEach(store.del);
-    S.key = ''; S.who = ''; S.data = null;
+    if (!armed(el, S.outbox.length ? 'Unsynced changes will be lost. Tap again' : 'Tap again to disconnect')) return;
+    ['key', 'who', 'data', 'outbox'].forEach(store.del);
+    Object.assign(S, { key: '', who: '', data: null, server: null, outbox: [] });
     $('#view').innerHTML = '';
+    updateSync();
     openSetup();
   },
-  copyKey: async btn => {
+  copyKey: async () => {
     try { await navigator.clipboard.writeText(showKey(S.key)); toast('Key copied'); }
     catch (e) { toast('Press and hold the key to copy it', true); }
+  },
+  syncNow: () => {
+    if (!S.outbox.length) { refresh().then(() => toast('Up to date')); return; }
+    clearTimeout(retryTimer);
+    flush();
   },
 
   preset: el => { const p = findPreset(el.dataset.n); if (!p) return; $('#fName').value = p.name; setCat(p.category); },
   cat: el => setCat(el.dataset.c),
 
-  saveExp: async btn => {
+  saveExp: () => {
     const d = S.draft, err = $('#fErr');
     const amount = parseAmt($('#fAmt').value);
     const name = $('#fName').value.trim();
     if (!(amount > 0)) return err.textContent = 'Enter an amount above zero.';
     if (!name) return err.textContent = 'Give the expense a name, or tap a quick pick.';
     if (!d.category) return err.textContent = 'Pick a category.';
-    const ok = await run('saveExpense', [{
-      id: d.id || '', created: d.created || '', amount, name, category: d.category,
+    queue('saveExpense', [{
+      id: d.id || uid(), created: d.created || Date.now(), amount, name, category: d.category,
       date: $('#fDate').value || iso(today()), who: currentWho('fWho')
-    }], btn, d.id ? 'Expense updated' : 'Expense saved');
-    if (ok) closeSheet();
+    }], d.id ? 'Expense updated' : 'Expense saved');
+    closeSheet();
   },
-  delExp: async btn => {
+  delExp: btn => {
     if (!armed(btn, 'Tap again to delete')) return;
-    if (await run('deleteExpense', [S.draft.id], btn, 'Expense deleted')) closeSheet();
+    queue('deleteExpense', [S.draft.id], 'Expense deleted');
+    closeSheet();
   },
 
-  saveInc: btn => {
+  saveInc: () => {
     const amount = parseAmt($('#iAmt').value);
     if (!(amount > 0)) return $('#iErr').textContent = 'Enter an amount above zero.';
-    run('saveIncome', [{ amount, date: $('#iDate').value || iso(today()), label: $('#iLabel').value, who: currentWho('iWho') }], btn, 'Income saved');
+    queue('saveIncome', [{
+      id: uid(), created: Date.now(), amount, date: $('#iDate').value || iso(today()),
+      label: $('#iLabel').value.trim() || 'Salary', who: currentWho('iWho')
+    }], 'Income saved');
+    $('#iAmt').value = '';
+    $('#iErr').textContent = '';
   },
-  delInc: el => { if (armed(el)) run('deleteIncome', [el.dataset.id], null, 'Income deleted'); },
+  delInc: el => { if (armed(el)) queue('deleteIncome', [el.dataset.id], 'Income deleted'); },
 
-  addGoal: btn => {
+  addGoal: () => {
     const name = $('#gName').value.trim(), target = parseAmt($('#gTarget').value), saved = parseAmt($('#gSaved').value) || 0;
     if (!name) return $('#gErr').textContent = 'Give the goal a name.';
     if (!(target > 0)) return $('#gErr').textContent = 'Enter a target above zero.';
-    run('saveGoal', [{ name, target, saved }], btn, 'Goal created');
+    queue('saveGoal', [{ id: uid(), created: Date.now(), name, target, saved }], 'Goal created');
+    ['gName', 'gTarget', 'gSaved'].forEach(id => { $('#' + id).value = ''; });
   },
   goalAdj: el => openGoalAdj(el.dataset.id, Number(el.dataset.dir)),
-  saveAdj: async btn => {
+  saveAdj: () => {
     const amount = parseAmt($('#aAmt').value);
     if (!(amount > 0)) return $('#aErr').textContent = 'Enter an amount above zero.';
-    if (await run('adjustGoal', [S.adj.id, amount * S.adj.dir], btn, S.adj.dir > 0 ? 'Money added' : 'Money taken out')) closeSheet();
+    queue('adjustGoal', [S.adj.id, amount * S.adj.dir], S.adj.dir > 0 ? 'Money added' : 'Money taken out');
+    closeSheet();
   },
-  delGoal: el => { if (armed(el)) run('deleteGoal', [el.dataset.id], null, 'Goal deleted'); },
+  delGoal: el => { if (armed(el)) queue('deleteGoal', [el.dataset.id], 'Goal deleted'); },
 
   sw: el => {
     S.sw = Number(el.dataset.i);
     document.querySelectorAll('.sw').forEach((b, i) => b.classList.toggle('on', i === S.sw));
   },
-  addCat: btn => run('saveCategory', [$('#cName').value, PALETTE[S.sw]], btn, 'Category added').then(ok => { if (ok) S.sw = null; }),
-  delCat: el => { if (armed(el)) run('deleteCategory', [el.dataset.n], null, 'Category deleted'); },
-  addPreset: btn => run('savePreset', [$('#pName').value, $('#pCat').value], btn, 'Quick pick added'),
-  delPreset: el => { if (armed(el)) run('deletePreset', [el.dataset.n], null, 'Quick pick deleted'); },
-  addPerson: btn => run('addPerson', [$('#pplName').value], btn, 'Person added'),
-  delPerson: el => { if (armed(el, 'Remove?')) run('deletePerson', [el.dataset.n], null, 'Person removed'); }
+  addCat: () => {
+    const name = $('#cName').value.trim();
+    if (!name) return toast('Type a category name first', true);
+    const color = PALETTE[S.sw];
+    $('#cName').value = '';
+    S.sw = null;
+    queue('saveCategory', [name, color], 'Category added');
+  },
+  delCat: el => { if (armed(el)) queue('deleteCategory', [el.dataset.n], 'Category deleted'); },
+  addPreset: () => {
+    const name = $('#pName').value.trim(), cat = $('#pCat').value;
+    if (!name) return $('#pErr').textContent = 'Type a name for the quick pick.';
+    if (!cat) return $('#pErr').textContent = 'Pick a category for the quick pick.';
+    $('#pName').value = '';
+    $('#pCat').value = '';
+    queue('savePreset', [name, cat], 'Quick pick added');
+  },
+  delPreset: el => { if (armed(el)) queue('deletePreset', [el.dataset.n], 'Quick pick deleted'); },
+  addPerson: () => {
+    const name = $('#pplName').value.trim();
+    if (!name) return toast('Type a name first', true);
+    $('#pplName').value = '';
+    queue('addPerson', [name], 'Person added');
+  },
+  delPerson: el => {
+    if (S.data.people.length <= 1) return toast('Keep at least one person', true);
+    if (armed(el, 'Remove?')) queue('deletePerson', [el.dataset.n], 'Person removed');
+  }
 };
 
 document.addEventListener('click', e => {
@@ -704,13 +866,16 @@ document.addEventListener('click', e => {
 });
 document.addEventListener('change', e => {
   const el = e.target;
-  if (el.dataset.chg === 'presetCat' && el.value) {
-    run('savePreset', [el.dataset.n, el.value], null, 'Quick pick updated');
-  }
+  if (el.dataset.chg === 'presetCat' && el.value) queue('savePreset', [el.dataset.n, el.value], 'Quick pick updated');
 });
-// Pick up changes made on the other phone whenever the app comes back to the foreground
+
+// Sync triggers: connection comes back, app returns to the foreground
+window.addEventListener('online', () => { clearTimeout(retryTimer); flush(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && S.key && !S.locked) refresh(true);
+  if (document.visibilityState !== 'visible' || !S.key || S.locked) return;
+  clearTimeout(retryTimer);
+  flush();
+  refresh();
 });
 
 /* ---------- Boot ---------- */
@@ -721,14 +886,9 @@ if ('serviceWorker' in navigator) {
 (function boot() {
   render();
   if (!S.key) { openSetup(); return; }
-  // Show the last known data instantly, then fetch fresh data in the background
-  try {
-    const cached = JSON.parse(store.get('data') || 'null');
-    if (cached) setData(cached);
-  } catch (e) {}
-  refresh(false).then(() => {
-    if (!S.data) $('#view').innerHTML = '<div class="empty">Couldn’t load your data. Close and reopen Penny to try again.</div>';
-  });
+  recompute(); // show the saved copy (plus anything queued) instantly
+  flush();
+  refresh();
 })();
 </script>
 </body>

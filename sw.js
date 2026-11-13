@@ -1,6 +1,6 @@
 // Penny service worker
 // Bump CACHE whenever you change any file, so phones pick up the new version.
-const CACHE = 'penny-v1.0.1';
+const CACHE = 'penny-v1.1.0';
 const SHELL = [
   './',
   './index.html',
