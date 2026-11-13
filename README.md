@@ -1,2 +1,0 @@
-# penny
-Expense tracker
