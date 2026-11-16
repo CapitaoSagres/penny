@@ -133,6 +133,18 @@
   .err-text{color:var(--danger);font-size:14px;margin-top:8px;min-height:1.2em}
 
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+  .warn{display:flex;gap:10px;align-items:flex-start;background:#FFF4D6;border:1px solid #F2B705;color:#5A4300;border-radius:12px;padding:10px 12px;margin:14px 0 0;font-size:15px}
+  .warn.over{background:#FBE3E1;border-color:#C8352E;color:#7A1F19}
+  @media (prefers-color-scheme:dark){.warn{background:#3A3010;border-color:#8A6D00;color:#F5DFA0}.warn.over{background:#3E1715;border-color:#E86A62;color:#F6C2BE}}
+  .mbar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin-top:6px}
+  .mbar span{display:block;height:100%}
+  .tag{font-size:12px;padding:1px 7px;border-radius:6px;border:1px solid var(--line);color:var(--muted);margin-left:6px;vertical-align:1px;font-weight:500}
+  .est .big{font-size:40px;font-weight:800;letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1.1;margin:4px 0 10px}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-top:1px solid var(--line);font-size:15px}
+  .kv:first-of-type{border-top:0}
+  .kv b{font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
+  .good{color:var(--good)}
+  .bad{color:var(--danger)}
   .sync{max-width:524px;margin:10px auto 0;padding:8px 14px;border-radius:10px;background:var(--surface);border:1px solid var(--line);font-size:14px;color:var(--muted);display:flex;align-items:center;gap:8px}
   .sync[hidden]{display:none}
   .sync::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--sun);flex:none}
@@ -162,10 +174,14 @@
 <section class="sheet" id="sheet" role="dialog" aria-modal="true"></section>
 <div class="toast" id="toast" role="status"></div>
 
+<script src="config.js"></script>
 <script>
-/* ===== CONFIG: paste your Apps Script web app URL (ends in /exec) ===== */
-const API_URL = 'https://script.google.com/macros/s/AKfycbwkPazp1swt1zhdXQXhXLEPk5axVvo4Goy7JvfqDeomWCfsVnS5v3JbdyDznOMlRlu4/exec';
-const VERSION = '1.1.0';
+/* Settings live in config.js, so updating this file never wipes your backend URL */
+const CFG = window.PENNY_CONFIG || {};
+const API_URL = CFG.apiUrl || '';
+const SAVINGS_START = /^\d{4}-\d{2}$/.test(CFG.savingsStart || '') ? CFG.savingsStart : '2027-01';
+const VERSION = '1.2.0';
+const ALERT_AT = 0.7; // personal-limit alert threshold
 
 /* ---------- Helpers ---------- */
 const $ = s => document.querySelector(s);
@@ -189,6 +205,28 @@ const normKey = k => String(k || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
 const showKey = k => (normKey(k).match(/.{1,4}/g) || []).join('-');
 const plural = (n, w) => n + ' ' + w + (n === 1 ? '' : 's');
 const APP_LINK = location.origin + location.pathname;
+const cap = w => w[0].toUpperCase() + w.slice(1);
+const ym = d => d.getFullYear() + '-' + pad(d.getMonth() + 1);
+const monthName = m => { const p = m.split('-').map(Number); return MONTHS[p[1] - 1] + ' ' + p[0]; };
+const prevYm = m => { const p = m.split('-').map(Number); return ym(new Date(p[0], p[1] - 2, 1)); };
+const inMonth = (x, m) => x.date.slice(0, 7) === m;
+const fullDate = s => { const d = parse(s); return d.getDate() + ' ' + MON[d.getMonth()] + ' ' + d.getFullYear(); };
+const catType = c => (c && ['fixed', 'personal'].includes(c.type)) ? c.type : 'shared';
+function limitsOf(c) {
+  if (!c) return {};
+  if (c.limits && typeof c.limits === 'object') return c.limits;
+  try { return JSON.parse(c.limits || '{}') || {}; } catch (e) { return {}; }
+}
+// Monthly target for a category. Personal categories: one person's limit, or everyone's added up.
+function catTarget(c, person) {
+  if (!c) return 0;
+  if (catType(c) === 'personal') {
+    const l = limitsOf(c);
+    return person ? (Number(l[person]) || 0) : S.data.people.reduce((t, p) => t + (Number(l[p]) || 0), 0);
+  }
+  return Number(c.target) || 0;
+}
+const getCat = name => S.data.categories.find(c => c.name === name);
 
 // Random id made on the phone, so an entry has its final id even before it reaches the Sheet
 function uid() {
@@ -211,14 +249,14 @@ const S = {
   data: null,                       // what's shown: server copy + outbox replayed on top
   tab: 'overview', view: 'month', offset: 0, filter: 'all',
   key: store.get('key') || '', who: store.get('who') || '',
-  draft: null, adj: null, sw: null, locked: false,
+  draft: null, adj: null, catDraft: null, goalDraft: null, renaming: null, goalsFor: '', locked: false,
   flushing: false, reqSeq: 0, appliedSeq: 0
 };
 
 /* ---------- Talking to the backend ---------- */
 async function call(action, ...args) {
   if (!/^https:\/\/script\.google\.com\//.test(API_URL)) {
-    throw new Error('The app isn’t connected to a backend yet. Paste the Apps Script URL into API_URL in index.html.');
+    throw new Error('The app isn’t connected to a backend yet. Paste the Apps Script URL into apiUrl in config.js.');
   }
   let res, out;
   try {
@@ -264,12 +302,25 @@ const LOCAL = {
   saveGoal:       (d, g) => upsertBy(d.goals, 'id', g),
   adjustGoal:     (d, id, delta) => { const g = d.goals.find(g => eq(g.id, id)); if (g) g.saved = Math.max(0, Math.round((g.saved + delta) * 100) / 100); },
   deleteGoal:     (d, id) => removeBy(d.goals, 'id', id),
-  saveCategory:   (d, name, color) => upsertBy(d.categories, 'name', { name, color }),
+  saveCategory:   (d, c, legacyColor) => {
+    if (typeof c !== 'object' || c === null) c = { name: c, color: legacyColor };
+    upsertBy(d.categories, 'name', { name: c.name, color: c.color, target: Number(c.target) || 0, type: c.type || 'shared', limits: JSON.stringify(c.limits || {}) });
+  },
   deleteCategory: (d, name) => removeBy(d.categories, 'name', name),
   savePreset:     (d, name, category) => upsertBy(d.presets, 'name', { name, category }),
   deletePreset:   (d, name) => removeBy(d.presets, 'name', name),
   addPerson:      (d, name) => { if (!d.people.some(p => eq(p, name))) d.people.push(name); },
-  deletePerson:   (d, name) => { d.people = d.people.filter(p => !eq(p, name)); }
+  deletePerson:   (d, name) => { d.people = d.people.filter(p => !eq(p, name)); },
+  renamePerson:   (d, from, to) => {
+    d.people = d.people.map(p => eq(p, from) ? to : p);
+    d.expenses.forEach(x => { if (eq(x.who, from)) x.who = to; });
+    d.income.forEach(x => { if (eq(x.who, from)) x.who = to; });
+    d.goals.forEach(g => { if (eq(g.owner, from)) g.owner = to; });
+    d.categories.forEach(c => {
+      const l = limitsOf(c), k = Object.keys(l).find(k => eq(k, from));
+      if (k) { l[to] = l[k]; delete l[k]; c.limits = JSON.stringify(l); }
+    });
+  }
 };
 function upsertBy(list, key, obj) {
   const i = list.findIndex(o => eq(o[key], obj[key]));
@@ -448,6 +499,80 @@ function relDay(d) {
   return dayLabel(parse(d));
 }
 
+/* ---------- Budgets ---------- */
+// One person's personal categories that have a limit, with spending for month m
+function personalStatus(person, m) {
+  return S.data.categories.filter(c => catType(c) === 'personal').map(c => {
+    const limit = catTarget(c, person);
+    const spent = sum(S.data.expenses.filter(x => x.category === c.name && x.who === person && inMonth(x, m)));
+    return { c, limit, spent, pct: limit ? spent / limit : 0 };
+  }).filter(s => s.limit > 0);
+}
+function budgetLine(s, person, m) {
+  const subj = person === S.who ? 'You’ve' : esc(person) + ' has';
+  const over = s.spent - s.limit;
+  return subj + ' spent <b>' + money(s.spent) + '</b> of the ' + money(s.limit) + ' ' + esc(s.c.name) + ' limit for ' + monthName(m) +
+    (over >= 0 ? ', ' + money(over) + ' over.' : '. ' + money(-over) + ' left.');
+}
+
+/* ---------- Savings estimate ----------
+   Per person, for the current month:
+   salary − half of shared and fixed costs − own personal spending.
+   Shared and personal spending come from last month; if last month is before
+   SAVINGS_START (e.g. December), the category targets are used instead. */
+function estimate(person) {
+  const D = S.data, m = ym(today());
+  if (m < SAVINGS_START) return { early: true };
+  const n = D.people.length || 1, prev = prevYm(m), hist = prev >= SAVINGS_START;
+
+  let income = sum(D.income.filter(x => x.who === person && inMonth(x, m)));
+  let incomeNote = 'received in ' + MONTHS[today().getMonth()];
+  if (!income) {
+    const mine = D.income.filter(x => x.who === person).sort((a, b) => b.date.localeCompare(a.date));
+    if (!mine.length) return { noIncome: true };
+    const lm = mine[0].date.slice(0, 7);
+    income = sum(mine.filter(x => inMonth(x, lm)));
+    incomeNote = 'expected, same as ' + monthName(lm);
+  }
+
+  let fixed = 0, everyday = 0, personal = 0;
+  const missing = [];
+  D.categories.forEach(c => {
+    const t = catType(c);
+    const prevAll = sum(D.expenses.filter(x => x.category === c.name && inMonth(x, prev)));
+    if (t === 'fixed') {
+      const e = Number(c.target) || (hist ? prevAll : 0);
+      if (!e) missing.push(c.name);
+      fixed += e / n;
+    } else if (t === 'personal') {
+      const e = hist ? sum(D.expenses.filter(x => x.category === c.name && x.who === person && inMonth(x, prev))) : catTarget(c, person);
+      if (!hist && !e) missing.push(c.name);
+      personal += e;
+    } else {
+      const e = hist ? prevAll : (Number(c.target) || 0);
+      if (!hist && !e) missing.push(c.name);
+      everyday += e / n;
+    }
+  });
+  if (hist) { // spending under categories that have since been deleted counts as shared
+    const known = new Set(D.categories.map(c => c.name));
+    everyday += sum(D.expenses.filter(x => !known.has(x.category) && inMonth(x, prev))) / n;
+  }
+  return { income, incomeNote, fixed, everyday, personal, save: income - fixed - everyday - personal, hist, prev, missing };
+}
+// How many monthly contributions are left before a goal's deadline (this month included)
+function monthsLeft(deadline) {
+  const t = today(), d = parse(deadline);
+  if (d < t) return 0;
+  return (d.getFullYear() - t.getFullYear()) * 12 + (d.getMonth() - t.getMonth()) + 1;
+}
+function goalNeed(g) {
+  const rest = g.target - g.saved;
+  if (rest <= 0 || !g.deadline) return null;
+  const m = monthsLeft(g.deadline);
+  return m ? rest / m : Infinity;
+}
+
 /* ---------- Views ---------- */
 function render() {
   document.querySelectorAll('.bar [data-tab]').forEach(b => b.classList.toggle('on', b.dataset.tab === S.tab));
@@ -485,6 +610,13 @@ function viewOverview() {
       (p === 'all' ? 'Everyone' : esc(p)) + '</button>').join('') + '</div>';
   }
 
+  if (S.who) {
+    const nowM = ym(today());
+    personalStatus(S.who, nowM).filter(s => s.pct >= ALERT_AT).forEach(s => {
+      h += '<div class="warn ' + (s.pct >= 1 ? 'over' : '') + '"><div>' + budgetLine(s, S.who, nowM) + '</div></div>';
+    });
+  }
+
   h += '<div class="total">' + money(total) + '</div>' +
        '<div class="muted">spent, ' + plural(ex.length, 'expense') + '</div>';
 
@@ -504,10 +636,20 @@ function viewOverview() {
   }
 
   if (catList.length) {
-    h += '<h2>By category</h2><ul class="rows">' + catList.map(([c, v]) =>
-      '<li><i class="dot" style="background:' + esc(catColor(c)) + '"></i>' +
-      '<div class="grow"><div class="t">' + esc(c) + '</div><div class="s">' + Math.round(v / total * 100) + '% of spending</div></div>' +
-      '<span class="amt">' + money(v) + '</span></li>').join('') + '</ul>';
+    h += '<h2>By category</h2><ul class="rows">' + catList.map(([c, v]) => {
+      const cat = getCat(c), t = catType(cat);
+      // Targets are monthly; personal limits follow the person filter, household targets show under Everyone
+      const tgt = S.view !== 'month' ? 0 : t === 'personal' ? catTarget(cat, S.filter === 'all' ? '' : S.filter) : (S.filter === 'all' ? catTarget(cat) : 0);
+      const pct = tgt ? v / tgt : 0;
+      const sub = tgt
+        ? money(v) + ' of ' + money(tgt) + (pct >= 1 ? ', ' + money(v - tgt) + ' over' : ', ' + money(tgt - v) + ' left')
+        : Math.round(v / total * 100) + '% of spending';
+      return '<li><i class="dot" style="background:' + esc(catColor(c)) + '"></i>' +
+        '<div class="grow"><div class="t">' + esc(c) + (t !== 'shared' ? '<span class="tag">' + cap(t) + '</span>' : '') + '</div>' +
+        '<div class="s' + (pct >= 1 ? ' bad' : '') + '">' + sub + '</div>' +
+        (tgt ? '<div class="mbar"><span style="width:' + Math.min(100, pct * 100) + '%;background:' + (pct >= 1 ? 'var(--danger)' : esc(catColor(c))) + '"></span></div>' : '') +
+        '</div><span class="amt">' + money(v) + '</span></li>';
+    }).join('') + '</ul>';
   }
 
   h += '<h2>Expenses</h2>';
@@ -560,46 +702,98 @@ function viewIncome() {
 }
 
 function viewGoals() {
-  const G = S.data.goals;
-  let h = '<h2 class="first">Savings goals</h2>';
-  if (!G.length) h += '<div class="empty">No goals yet. Add one below, like an emergency fund or a holiday.</div>';
+  const D = S.data;
+  const viewer = D.people.includes(S.goalsFor) ? S.goalsFor : (S.who || D.people[0]);
+  const own = viewer === S.who;
+  const yours = own ? 'Your' : esc(viewer) + '’s';
+  let h = '';
+
+  if (D.people.length > 1) {
+    h += '<div class="chips center" style="margin-top:4px">' + D.people.map(p =>
+      '<button class="chip ' + (p === viewer ? 'on' : '') + '" data-act="goalsFor" data-p="' + esc(p) + '">' + esc(p) + '</button>').join('') + '</div>';
+  }
+
+  // Monthly estimate
+  const e = estimate(viewer);
+  h += '<h2 class="first">' + yours + ' monthly savings</h2><div class="goal est">';
+  if (e.early) {
+    h += '<p class="note" style="margin:0">The estimate starts in ' + monthName(SAVINGS_START) + '. December is left out because it’s an unusual spending month.</p>';
+  } else if (e.noIncome) {
+    h += '<p class="note" style="margin:0">Add ' + (own ? 'your' : esc(viewer) + '’s') + ' salary in the Income tab to see how much can go to savings.</p>';
+  } else {
+    h += '<small class="muted">Can put aside in ' + MONTHS[today().getMonth()] + '</small>' +
+      '<div class="big ' + (e.save < 0 ? 'bad' : '') + '">' + money(Math.max(0, e.save)) + '</div>' +
+      '<div class="kv"><span>Salary <span class="muted">(' + esc(e.incomeNote) + ')</span></span><b>' + money(e.income) + '</b></div>' +
+      '<div class="kv"><span>Fixed costs <span class="muted">(your half)</span></span><b>−' + money(e.fixed) + '</b></div>' +
+      '<div class="kv"><span>Everyday spending <span class="muted">(your half)</span></span><b>−' + money(e.everyday) + '</b></div>' +
+      '<div class="kv"><span>Personal spending</span><b>−' + money(e.personal) + '</b></div>';
+    if (e.save < 0) h += '<div class="warn over"><div>Expected costs are ' + money(-e.save) + ' more than the salary this month.</div></div>';
+    h += '<p class="note" style="margin:10px 0 0">' + (e.hist
+      ? 'Based on ' + monthName(e.prev) + '’s spending. Shared costs split 50/50.'
+      : 'First month counted, so spending is based on your category targets. Shared costs split 50/50.') + '</p>';
+    if (e.missing.length) h += '<p class="note" style="margin:6px 0 0">No target set for ' + e.missing.map(esc).join(', ') + '. Add targets in Settings for a better estimate.</p>';
+  }
+  h += '</div>';
+
+  // Goals
+  const G = D.goals.filter(g => g.owner ? g.owner === viewer : true);
+  const needs = G.map(goalNeed).filter(v => v !== null);
+  if (!e.early && !e.noIncome && needs.length) {
+    const total = needs.reduce((t, v) => t + v, 0);
+    if (isFinite(total)) {
+      const ok = total <= Math.max(0, e.save);
+      h += '<div class="warn ' + (ok ? '' : 'over') + '" style="' + (ok ? 'background:transparent;border-color:var(--line);color:inherit' : '') + '"><div>' +
+        (own ? 'Your' : esc(viewer) + '’s') + ' goals need <b>' + money(total) + '</b> a month. ' +
+        (ok ? 'That fits within this month’s estimate.' : 'That’s ' + money(total - Math.max(0, e.save)) + ' more than this month’s estimate.') + '</div></div>';
+    }
+  }
+
+  h += '<h2>' + yours + ' goals</h2>';
+  if (!G.length) h += '<div class="empty">' + (own ? 'No goals yet. Add one below, like an emergency fund or a holiday.' : esc(viewer) + ' has no savings goals yet.') + '</div>';
   G.forEach(g => {
     const pct = g.target ? Math.min(100, g.saved / g.target * 100) : 0;
     const rest = g.target - g.saved;
+    const need = goalNeed(g);
+    let plan = '';
+    if (rest <= 0) plan = 'Goal reached';
+    else if (g.deadline && need === Infinity) plan = '<span class="bad">Deadline ' + fullDate(g.deadline) + ' has passed</span>';
+    else if (g.deadline) plan = money(need) + ' a month to reach it by ' + fullDate(g.deadline);
     h += '<div class="goal">' +
       '<div class="line"><strong>' + esc(g.name) + '</strong><span class="muted">' + Math.floor(pct) + '%</span></div>' +
       '<div class="progress"><span style="width:' + pct + '%"></span></div>' +
       '<div class="line"><span class="amt">' + money(g.saved) + '</span><span class="muted">of ' + money(g.target) +
-      (rest > 0 ? ', ' + money(rest) + ' to go' : ', reached') + '</span></div>' +
-      '<div class="acts">' +
-      '<button class="btn" data-act="goalAdj" data-id="' + esc(g.id) + '" data-dir="1">Add money</button>' +
-      '<button class="btn ghost" data-act="goalAdj" data-id="' + esc(g.id) + '" data-dir="-1">Take out</button>' +
-      '<button class="x" data-act="delGoal" data-id="' + esc(g.id) + '" aria-label="Delete goal">×</button>' +
-      '</div></div>';
+      (rest > 0 ? ', ' + money(rest) + ' to go' : '') + '</span></div>' +
+      (plan ? '<div class="note" style="margin:6px 0 0">' + plan + '</div>' : '') +
+      (own || !g.owner ? '<div class="acts">' +
+        '<button class="btn" data-act="goalAdj" data-id="' + esc(g.id) + '" data-dir="1">Add money</button>' +
+        '<button class="btn ghost" data-act="goalAdj" data-id="' + esc(g.id) + '" data-dir="-1">Take out</button>' +
+        '<button class="btn ghost" style="flex:0 0 auto;width:auto;padding:10px 14px" data-act="editGoal" data-id="' + esc(g.id) + '">Edit</button>' +
+        '</div>' : '') +
+      '</div>';
   });
-  h += '<h2>New goal</h2>' +
-    '<label class="f" for="gName">Name</label><input id="gName" placeholder="e.g. Emergency fund">' +
-    '<div class="row2"><div><label class="f" for="gTarget">Target</label><input id="gTarget" inputmode="decimal" placeholder="€0.00"></div>' +
-    '<div><label class="f" for="gSaved">Already saved</label><input id="gSaved" inputmode="decimal" placeholder="€0.00"></div></div>' +
-    '<div class="err-text" id="gErr"></div>' +
-    '<button class="btn" data-act="addGoal">Create goal</button>';
+
+  if (own) {
+    h += '<h2>New goal</h2>' +
+      '<label class="f" for="gName">Name</label><input id="gName" placeholder="e.g. Emergency fund">' +
+      '<div class="row2"><div><label class="f" for="gTarget">Goal amount</label><input id="gTarget" inputmode="decimal" placeholder="€0.00"></div>' +
+      '<div><label class="f" for="gDeadline">Reach it by</label><input id="gDeadline" type="date"></div></div>' +
+      '<label class="f" for="gSaved">Already saved</label><input id="gSaved" inputmode="decimal" placeholder="€0.00">' +
+      '<div class="err-text" id="gErr"></div>' +
+      '<button class="btn" data-act="addGoal">Create goal</button>';
+  } else if (!S.who) {
+    h += '<p class="note" style="margin-top:14px">Pick who’s using this phone to add goals.</p>';
+  }
   return h;
 }
 
 function viewSettings() {
   const D = S.data;
-  if (S.sw === null) {
-    const used = D.categories.map(c => c.color.toUpperCase());
-    const free = PALETTE.findIndex(p => !used.includes(p.toUpperCase()));
-    S.sw = free < 0 ? 0 : free;
-  }
-  let h = '<h2 class="first">Categories</h2><ul class="rows">' + D.categories.map(c =>
-    '<li><i class="dot" style="background:' + esc(c.color) + '"></i><div class="grow">' + esc(c.name) + '</div>' +
-    '<button class="x" data-act="delCat" data-n="' + esc(c.name) + '" aria-label="Delete ' + esc(c.name) + '">×</button></li>').join('') + '</ul>' +
-    '<label class="f" for="cName">New category</label>' +
-    '<div class="inline"><input id="cName" placeholder="e.g. Health"><button class="btn" data-act="addCat">Add</button></div>' +
-    '<div class="swatches">' + PALETTE.map((p, i) =>
-      '<button class="sw ' + (i === S.sw ? 'on' : '') + '" style="background:' + p + '" data-act="sw" data-i="' + i + '" aria-label="Colour ' + (i + 1) + '"></button>').join('') + '</div>';
+  let h = '<h2 class="first">Categories</h2><p class="note">Tap a category to set its monthly target. Fixed is for steady monthly bills; Personal gives each person their own limit, with an alert at 70%.</p>' +
+    '<ul class="rows">' + D.categories.map(c =>
+      '<li class="tap" data-act="editCat" data-n="' + esc(c.name) + '"><i class="dot" style="background:' + esc(c.color) + '"></i>' +
+      '<div class="grow"><div class="t">' + esc(c.name) + (catType(c) !== 'shared' ? '<span class="tag">' + cap(catType(c)) + '</span>' : '') + '</div>' +
+      '<div class="s">' + catSummary(c) + '</div></div><span class="muted">›</span></li>').join('') + '</ul>' +
+    '<button class="btn ghost" data-act="newCat">Add category</button>';
 
   h += '<h2>Quick picks</h2><p class="note">Names you can tap when adding an expense. Each one fills in its category for you.</p>' +
     (D.presets.length ? '<ul class="rows">' + D.presets.map(p =>
@@ -613,6 +807,7 @@ function viewSettings() {
 
   h += '<h2>People</h2><ul class="rows">' + D.people.map(p =>
     '<li><div class="grow">' + esc(p) + '</div>' +
+    '<button class="btn ghost" style="width:auto;margin:0;padding:6px 12px" data-act="rename" data-n="' + esc(p) + '">Rename</button>' +
     (D.people.length > 1 ? '<button class="x" data-act="delPerson" data-n="' + esc(p) + '" aria-label="Remove ' + esc(p) + '">×</button>' : '') +
     '</li>').join('') + '</ul>' +
     '<div class="inline" style="margin-top:10px"><input id="pplName" placeholder="Add a name"><button class="btn" data-act="addPerson">Add</button></div>';
@@ -649,6 +844,95 @@ function closeSheet(force) {
 }
 const sheetHead = (title, noClose) => '<div class="head"><h3>' + title + '</h3>' +
   (noClose ? '' : '<button class="x" data-act="close" aria-label="Close">×</button>') + '</div>';
+
+function catSummary(c) {
+  const t = catType(c);
+  if (t === 'personal') {
+    const l = limitsOf(c);
+    const set = S.data.people.filter(p => Number(l[p]) > 0);
+    return set.length ? set.map(p => esc(p) + ' ' + money(l[p])).join(', ') + ' a month' : 'No limits set yet';
+  }
+  const tgt = Number(c.target) || 0;
+  if (t === 'fixed') return tgt ? 'About ' + money(tgt) + ' a month' : 'No monthly amount set yet';
+  return tgt ? 'Target ' + money(tgt) + ' a month' : 'No target';
+}
+
+function openCategory(c) {
+  if (c) {
+    S.catDraft = { isNew: false, name: c.name, color: c.color, type: catType(c), target: Number(c.target) || 0, limits: Object.assign({}, limitsOf(c)) };
+  } else {
+    const used = S.data.categories.map(c => String(c.color).toUpperCase());
+    const free = PALETTE.find(p => !used.includes(p.toUpperCase())) || PALETTE[0];
+    S.catDraft = { isNew: true, name: '', color: free, type: 'shared', target: 0, limits: {} };
+  }
+  renderCatSheet();
+}
+function syncCatDraft() {
+  const d = S.catDraft;
+  if ($('#cdName')) d.name = $('#cdName').value;
+  if ($('#cdTarget')) d.target = parseAmt($('#cdTarget').value) || 0;
+  document.querySelectorAll('.cdLim').forEach(el => { d.limits[el.dataset.p] = parseAmt(el.value) || 0; });
+}
+function renderCatSheet() {
+  const d = S.catDraft, P = S.data.people;
+  const info = {
+    shared: 'A household cost. Split 50/50 in the savings estimate.',
+    fixed: 'A bill that’s about the same every month, like rent. The amount below is used as the expected cost each month.',
+    personal: 'Each person gets their own monthly limit. An alert pops up at 70%.'
+  };
+  openSheet(
+    sheetHead(d.isNew ? 'New category' : esc(d.name)) +
+    (d.isNew ? '<label class="f" for="cdName">Name</label><input id="cdName" value="' + esc(d.name) + '" placeholder="e.g. Health">' : '') +
+    '<label class="f">Type</label><div class="seg">' + ['shared', 'fixed', 'personal'].map(t =>
+      '<button data-act="cdType" data-t="' + t + '" class="' + (d.type === t ? 'on' : '') + '">' + cap(t) + '</button>').join('') + '</div>' +
+    '<p class="note" style="margin:8px 0 0">' + info[d.type] + '</p>' +
+    (d.type === 'personal'
+      ? P.map((p, i) => '<label class="f" for="cdLim' + i + '">Monthly limit for ' + esc(p) + '</label>' +
+          '<input id="cdLim' + i + '" class="cdLim" data-p="' + esc(p) + '" inputmode="decimal" placeholder="No limit" value="' + (Number(d.limits[p]) > 0 ? Number(d.limits[p]).toFixed(2) : '') + '">').join('')
+      : '<label class="f" for="cdTarget">' + (d.type === 'fixed' ? 'Usual monthly amount' : 'Monthly target (max)') + '</label>' +
+        '<input id="cdTarget" inputmode="decimal" placeholder="' + (d.type === 'fixed' ? '€0.00' : 'No target') + '" value="' + (d.target ? d.target.toFixed(2) : '') + '">') +
+    '<label class="f">Colour</label><div class="swatches">' + PALETTE.map(p =>
+      '<button class="sw ' + (p.toUpperCase() === String(d.color).toUpperCase() ? 'on' : '') + '" style="background:' + p + '" data-act="cdColor" data-c="' + p + '" aria-label="Colour ' + p + '"></button>').join('') + '</div>' +
+    '<div class="err-text" id="cdErr"></div>' +
+    '<button class="btn" data-act="saveCat">' + (d.isNew ? 'Add category' : 'Save changes') + '</button>' +
+    (d.isNew ? '' : '<button class="btn danger" data-act="delCatSheet">Delete category</button>')
+  );
+}
+
+function openBudgetAlert(s, person, m) {
+  const over = s.pct >= 1;
+  openSheet(
+    sheetHead(over ? esc(s.c.name) + ' limit passed' : esc(s.c.name) + ' at ' + Math.floor(s.pct * 100) + '%') +
+    '<div class="warn ' + (over ? 'over' : '') + '" style="margin-top:4px"><div>' + budgetLine(s, person, m) + '</div></div>' +
+    '<div class="mbar" style="height:10px;margin-top:14px"><span style="width:' + Math.min(100, s.pct * 100) + '%;background:' + (over ? 'var(--danger)' : 'var(--sun)') + '"></span></div>' +
+    '<button class="btn" data-act="close">Got it</button>'
+  );
+}
+
+function openRename(p) {
+  S.renaming = p;
+  openSheet(
+    sheetHead('Rename ' + esc(p)) +
+    '<label class="f" for="rnName">New name</label><input id="rnName" value="' + esc(p) + '" autocomplete="off">' +
+    '<p class="note" style="margin-top:8px">Their past expenses, income, goals and limits move to the new name.</p>' +
+    '<div class="err-text" id="rnErr"></div>' +
+    '<button class="btn" data-act="saveRename">Rename</button>'
+  );
+}
+
+function openGoalEdit(g) {
+  S.goalDraft = Object.assign({}, g);
+  openSheet(
+    sheetHead('Edit goal') +
+    '<label class="f" for="geName">Name</label><input id="geName" value="' + esc(g.name) + '">' +
+    '<div class="row2"><div><label class="f" for="geTarget">Goal amount</label><input id="geTarget" inputmode="decimal" value="' + g.target.toFixed(2) + '"></div>' +
+    '<div><label class="f" for="geDeadline">Reach it by</label><input id="geDeadline" type="date" value="' + esc(g.deadline || '') + '"></div></div>' +
+    '<p class="note" style="margin-top:8px">Saved so far: ' + money(g.saved) + '. Use Add money or Take out to change it.</p>' +
+    '<div class="err-text" id="geErr"></div>' +
+    '<button class="btn" data-act="saveGoalEdit">Save changes</button>' +
+    '<button class="btn danger" data-act="delGoalSheet">Delete goal</button>'
+  );
+}
 
 function openSetup(msg) {
   openSheet(
@@ -779,6 +1063,7 @@ const ACTS = {
 
   saveExp: () => {
     const d = S.draft, err = $('#fErr');
+    const who = currentWho('fWho'), m = ($('#fDate').value || iso(today())).slice(0, 7);
     const amount = parseAmt($('#fAmt').value);
     const name = $('#fName').value.trim();
     if (!(amount > 0)) return err.textContent = 'Enter an amount above zero.';
@@ -786,9 +1071,12 @@ const ACTS = {
     if (!d.category) return err.textContent = 'Pick a category.';
     queue('saveExpense', [{
       id: d.id || uid(), created: d.created || Date.now(), amount, name, category: d.category,
-      date: $('#fDate').value || iso(today()), who: currentWho('fWho')
+      date: $('#fDate').value || iso(today()), who
     }], d.id ? 'Expense updated' : 'Expense saved');
     closeSheet();
+    // Personal-limit alert at 70%
+    const st = personalStatus(who, m).find(s => s.c.name === d.category);
+    if (st && st.pct >= ALERT_AT) setTimeout(() => openBudgetAlert(st, who, m), 260);
   },
   delExp: btn => {
     if (!armed(btn, 'Tap again to delete')) return;
@@ -810,10 +1098,28 @@ const ACTS = {
 
   addGoal: () => {
     const name = $('#gName').value.trim(), target = parseAmt($('#gTarget').value), saved = parseAmt($('#gSaved').value) || 0;
+    const deadline = $('#gDeadline').value;
     if (!name) return $('#gErr').textContent = 'Give the goal a name.';
-    if (!(target > 0)) return $('#gErr').textContent = 'Enter a target above zero.';
-    queue('saveGoal', [{ id: uid(), created: Date.now(), name, target, saved }], 'Goal created');
-    ['gName', 'gTarget', 'gSaved'].forEach(id => { $('#' + id).value = ''; });
+    if (!(target > 0)) return $('#gErr').textContent = 'Enter a goal amount above zero.';
+    if (deadline && deadline < iso(today())) return $('#gErr').textContent = 'Pick a date in the future.';
+    queue('saveGoal', [{ id: uid(), created: Date.now(), name, target, saved, owner: S.who, deadline }], 'Goal created');
+    ['gName', 'gTarget', 'gSaved', 'gDeadline'].forEach(id => { if ($('#' + id)) $('#' + id).value = ''; });
+  },
+  goalsFor: el => { S.goalsFor = el.dataset.p; render(); },
+  editGoal: el => { const g = S.data.goals.find(g => g.id === el.dataset.id); if (g) openGoalEdit(g); },
+  saveGoalEdit: () => {
+    const g = S.goalDraft;
+    const name = $('#geName').value.trim(), target = parseAmt($('#geTarget').value), deadline = $('#geDeadline').value;
+    if (!name) return $('#geErr').textContent = 'Give the goal a name.';
+    if (!(target > 0)) return $('#geErr').textContent = 'Enter a goal amount above zero.';
+    const cur = S.data.goals.find(x => x.id === g.id);
+    queue('saveGoal', [{ id: g.id, created: g.created, name, target, saved: cur ? cur.saved : g.saved, owner: g.owner || S.who, deadline }], 'Goal updated');
+    closeSheet();
+  },
+  delGoalSheet: btn => {
+    if (!armed(btn, 'Tap again to delete')) return;
+    queue('deleteGoal', [S.goalDraft.id], 'Goal deleted');
+    closeSheet();
   },
   goalAdj: el => openGoalAdj(el.dataset.id, Number(el.dataset.dir)),
   saveAdj: () => {
@@ -822,21 +1128,42 @@ const ACTS = {
     queue('adjustGoal', [S.adj.id, amount * S.adj.dir], S.adj.dir > 0 ? 'Money added' : 'Money taken out');
     closeSheet();
   },
-  delGoal: el => { if (armed(el)) queue('deleteGoal', [el.dataset.id], 'Goal deleted'); },
 
-  sw: el => {
-    S.sw = Number(el.dataset.i);
-    document.querySelectorAll('.sw').forEach((b, i) => b.classList.toggle('on', i === S.sw));
+  newCat: () => openCategory(),
+  editCat: el => { const c = getCat(el.dataset.n); if (c) openCategory(c); },
+  cdType: el => { syncCatDraft(); S.catDraft.type = el.dataset.t; renderCatSheet(); },
+  cdColor: el => {
+    S.catDraft.color = el.dataset.c;
+    document.querySelectorAll('#sheet .sw').forEach(b => b.classList.toggle('on', b === el));
   },
-  addCat: () => {
-    const name = $('#cName').value.trim();
-    if (!name) return toast('Type a category name first', true);
-    const color = PALETTE[S.sw];
-    $('#cName').value = '';
-    S.sw = null;
-    queue('saveCategory', [name, color], 'Category added');
+  saveCat: () => {
+    syncCatDraft();
+    const d = S.catDraft, name = d.name.trim();
+    if (!name) return $('#cdErr').textContent = 'Type a category name.';
+    if (d.isNew && S.data.categories.some(c => eq(c.name, name))) return $('#cdErr').textContent = 'There’s already a category called ' + name + '.';
+    const limits = {};
+    if (d.type === 'personal') S.data.people.forEach(p => { if (d.limits[p] > 0) limits[p] = d.limits[p]; });
+    queue('saveCategory', [{ name, color: d.color, type: d.type, target: d.type === 'personal' ? 0 : d.target, limits }],
+      d.isNew ? 'Category added' : 'Category saved');
+    closeSheet();
   },
-  delCat: el => { if (armed(el)) queue('deleteCategory', [el.dataset.n], 'Category deleted'); },
+  delCatSheet: btn => {
+    if (!armed(btn, 'Tap again to delete')) return;
+    queue('deleteCategory', [S.catDraft.name], 'Category deleted');
+    closeSheet();
+  },
+  rename: el => openRename(el.dataset.n),
+  saveRename: () => {
+    const from = S.renaming, to = $('#rnName').value.trim();
+    if (!to) return $('#rnErr').textContent = 'Type a name.';
+    if (to === from) return closeSheet();
+    if (!eq(to, from) && S.data.people.some(p => eq(p, to))) return $('#rnErr').textContent = 'There’s already someone called ' + to + '.';
+    if (eq(S.who, from)) { S.who = to; store.set('who', to); }
+    if (S.filter === from) S.filter = to;
+    if (S.goalsFor === from) S.goalsFor = to;
+    queue('renamePerson', [from, to], 'Renamed to ' + to);
+    closeSheet();
+  },
   addPreset: () => {
     const name = $('#pName').value.trim(), cat = $('#pCat').value;
     if (!name) return $('#pErr').textContent = 'Type a name for the quick pick.';
