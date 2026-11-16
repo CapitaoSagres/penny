@@ -593,7 +593,7 @@ function goalNeed(g) {
 /* ---------- Views ---------- */
 // Each person's colour theme. config.js can override with themes: { Name: 'ink' | 'rose' }
 const THEMES = (() => {
-  const t = { captain: 'ink', rita: 'rose' };
+  const t = { Joao: 'ink', Rita: 'rose' };
   Object.entries(CFG.themes || {}).forEach(([k, v]) => { t[String(k).toLowerCase()] = v; });
   return t;
 })();
